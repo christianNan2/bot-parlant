@@ -6,4 +6,5 @@ __pycache__/
 deploy/*.zip
 backend/deploy.zip
 backend/*.zip
-backend/antenv/
+frontend/node_modules/
+backend/static/dashboard/

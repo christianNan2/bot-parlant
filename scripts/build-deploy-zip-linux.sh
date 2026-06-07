@@ -11,6 +11,9 @@ IMAGE="${ORYX_BUILD_IMAGE:-mcr.microsoft.com/azure-app-service/python:3.12}"
 mkdir -p "${ROOT}/deploy"
 rm -f "$ZIP"
 
+echo "Building dashboard into backend/static/dashboard/ ..."
+"${ROOT}/scripts/build-frontend.sh"
+
 echo "Installing Python packages in ${IMAGE} (first run may pull the image)..."
 docker run --rm \
   -v "${ROOT}/backend:/app" \

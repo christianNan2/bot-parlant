@@ -179,6 +179,8 @@ Copy the content of `backend/prompts/agent-registration-instructions.md` into th
 | Agent never calls the tool | OpenAPI tool not attached, or instructions don't require confirmation |
 | Tool fails / timeout | `BACKEND_PUBLIC_URL` wrong; Foundry cannot reach localhost without a tunnel |
 | 503 Database not configured | Missing `AZURE_SQL_*` in App Service settings |
+| 500/503 Database firewall / `40615` | SQL server blocks App Service outbound IPs — enable **Allow Azure services** on the SQL server, or add outbound IPs: `az webapp show -g <rg> -n <app> --query outboundIpAddresses -o tsv` |
 | 503 Azure AD sign-in failed | Run `az login` locally, or grant managed identity on SQL |
+| 400 placeholder email (`none@gmail.com`) | Agent called the tool without a real email — re-collect email before confirming |
 | 409 Email already registered | Duplicate `Email` (UNIQUE constraint) |
 | 401 Unauthorized | `REGISTRATION_API_KEY` set on server but not in Foundry connection |

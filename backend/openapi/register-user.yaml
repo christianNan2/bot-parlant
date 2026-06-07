@@ -47,6 +47,9 @@ components:
   schemas:
     UserRegistration:
       type: object
+      description: >
+        Field names match dbo.Users columns (firstName, lastName, email,
+        birthDate, phone, street, zip, city, country).
       required:
         - firstName
         - lastName
@@ -63,13 +66,13 @@ components:
           type: string
           format: date
           nullable: true
-        phoneNumber:
+        phone:
           type: string
           nullable: true
-        streetAddress:
+        street:
           type: string
           nullable: true
-        zipCode:
+        zip:
           type: string
           nullable: true
         city:

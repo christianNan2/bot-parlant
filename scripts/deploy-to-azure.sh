@@ -9,6 +9,32 @@ PREBUILT="${3:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ZIP="${ROOT}/deploy/app.zip"
 
+build_frontend() {
+  echo "Building dashboard into backend/static/dashboard/ ..."
+  "${ROOT}/scripts/build-frontend.sh"
+}
+
+pack_backend_zip() {
+  local exclude_antenv="${1:-false}"
+  rm -f "$ZIP"
+  echo "Packaging backend (Flask app + static dashboard + chat)..."
+  local -a excludes=(
+    -x ".venv/*"
+    -x ".env"
+    -x "__pycache__/*"
+    -x "*.pyc"
+    -x "deploy.zip"
+    -x "*.zip"
+  )
+  if [[ "$exclude_antenv" == "true" ]]; then
+    excludes+=(-x "antenv/*")
+  fi
+  (
+    cd "${ROOT}/backend"
+    zip -r "$ZIP" . "${excludes[@]}"
+  )
+}
+
 if ! az webapp show --resource-group "$RESOURCE_GROUP" --name "$WEBAPP_NAME" &>/dev/null; then
   echo "Web app '${WEBAPP_NAME}' not found in '${RESOURCE_GROUP}'."
   echo "Create it first: ./scripts/create-azure-webapp.sh ${WEBAPP_NAME} ${RESOURCE_GROUP}"
@@ -22,33 +48,12 @@ if [[ "$PREBUILT" == "--prebuilt" ]]; then
     echo "Missing backend/antenv. Run: ./scripts/build-deploy-zip-linux.sh"
     exit 1
   fi
-  rm -f "$ZIP"
-  echo "Packaging app with pre-built antenv..."
-  (
-    cd "${ROOT}/backend"
-    zip -r "$ZIP" . \
-      -x ".venv/*" \
-      -x ".env" \
-      -x "__pycache__/*" \
-      -x "*.pyc" \
-      -x "deploy.zip" \
-      -x "*.zip"
-  )
+  build_frontend
+  pack_backend_zip false
 elif [[ ! -f "$ZIP" ]] || [[ "${REBUILD_ZIP:-}" == "1" ]]; then
   mkdir -p "${ROOT}/deploy"
-  rm -f "$ZIP"
-  echo "Packaging app (excluding .venv, .env, stray zips)..."
-  (
-    cd "${ROOT}/backend"
-    zip -r "$ZIP" . \
-      -x ".venv/*" \
-      -x "antenv/*" \
-      -x ".env" \
-      -x "__pycache__/*" \
-      -x "*.pyc" \
-      -x "deploy.zip" \
-      -x "*.zip"
-  )
+  build_frontend
+  pack_backend_zip true
 fi
 
 SCM_BUILD="$(az webapp config appsettings list \
@@ -88,6 +93,8 @@ for _ in 1 2 3 4 5 6; do
     cat /tmp/voicebot-health.txt
     echo ""
     echo "OK — https://${HOST}"
+    echo "     Chat:       https://${HOST}/"
+    echo "     Dashboard:  https://${HOST}/dashboard/"
     exit 0
   fi
   sleep 10

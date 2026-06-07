@@ -32,6 +32,8 @@ Optional (ask once; accept "skip" or "I don't know"):
 Map collected values to the API body:
 
 - `firstName`, `lastName`, `email` (required)
-- `birthDate`, `phoneNumber`, `streetAddress`, `zipCode`, `city`, `country` (omit or null if unknown)
+- `birthDate`, `phone`, `street`, `zip`, `city`, `country` (omit or null if unknown; names match dbo.Users columns)
 
 Do not invent data. Use exactly what the user provided.
+
+Never use placeholder values such as `None`, `null`, or made-up emails. If email is missing or unclear, ask again before calling the tool.

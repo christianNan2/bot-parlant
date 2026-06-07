@@ -1,19 +1,38 @@
 import os
+import secrets
+from functools import wraps
 from pathlib import Path
 from threading import Lock
 
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, redirect, render_template, request, send_from_directory
 from flask_sock import Sock
 
+from dashboard_auth import SESSION_COOKIE, create_session, destroy_session, get_session
 from openapi_loader import backend_public_url, dump_register_user_openapi_yaml, load_register_user_openapi
-from user_repository import UserRegistrationError, is_sql_configured, register_user, user_from_payload
+from user_repository import (
+    SqlCredentials,
+    UserRegistrationError,
+    delete_user,
+    get_user,
+    get_user_stats,
+    is_dashboard_sql_configured,
+    is_sql_configured,
+    list_users,
+    register_user,
+    reset_sql_credentials_override,
+    set_sql_credentials_override,
+    update_user,
+    user_from_payload,
+    verify_sql_login,
+)
 from voice_service import handle_voice_websocket, is_voice_configured, public_voice_config
 
 app = Flask(__name__)
 load_dotenv(Path(__file__).with_name(".env"))
+app.config["SECRET_KEY"] = (os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)).strip()
 sock = Sock(app)
 
 
@@ -111,6 +130,93 @@ class FoundryChatService:
 foundry_service = FoundryChatService()
 
 
+def _dashboard_session_cookie_secure() -> bool:
+    return (os.getenv("FLASK_COOKIE_SECURE") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _set_dashboard_session_cookie(response: Response, token: str) -> Response:
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="Lax",
+        secure=_dashboard_session_cookie_secure(),
+        max_age=8 * 60 * 60,
+        path="/",
+    )
+    return response
+
+
+def _clear_dashboard_session_cookie(response: Response) -> Response:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+def dashboard_login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        session = get_session(request.cookies.get(SESSION_COOKIE))
+        if not session:
+            return jsonify({"error": "Unauthorized"}), 401
+        if not is_dashboard_sql_configured():
+            return jsonify({"error": "Database is not configured on the server."}), 503
+
+        token = set_sql_credentials_override(
+            SqlCredentials(username=session.username, password=session.password)
+        )
+        g.dashboard_username = session.username
+        g._sql_cred_token = token
+        try:
+            return view(*args, **kwargs)
+        finally:
+            reset_sql_credentials_override(token)
+
+    return wrapped
+
+
+@app.post("/api/dashboard/login")
+def dashboard_login():
+    if not is_dashboard_sql_configured():
+        return jsonify({"error": "Database server is not configured on the server."}), 503
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON body required."}), 400
+
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
+
+    try:
+        verify_sql_login(username, password)
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    token = create_session(username, password)
+    response = jsonify({"authenticated": True, "username": username})
+    return _set_dashboard_session_cookie(response, token)
+
+
+@app.post("/api/dashboard/logout")
+def dashboard_logout():
+    destroy_session(request.cookies.get(SESSION_COOKIE))
+    response = jsonify({"authenticated": False})
+    return _clear_dashboard_session_cookie(response)
+
+
+@app.get("/api/dashboard/session")
+def dashboard_session():
+    session = get_session(request.cookies.get(SESSION_COOKIE))
+    return jsonify(
+        {
+            "authenticated": session is not None,
+            "username": session.username if session else None,
+            "databaseConfigured": is_dashboard_sql_configured(),
+        }
+    )
+
+
 def _registration_api_key_ok() -> bool:
     expected = (os.getenv("REGISTRATION_API_KEY") or "").strip()
     if not expected:
@@ -162,6 +268,137 @@ def api_register_user():
     return jsonify(result), 201
 
 
+@app.post("/api/users")
+@dashboard_login_required
+def api_create_user():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON body required."}), 400
+
+    try:
+        user = user_from_payload(payload)
+        result = register_user(user)
+        if result.get("userId") is not None:
+            return jsonify(get_user(int(result["userId"]))), 201
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    return jsonify(result), 201
+
+
+@app.get("/api/users")
+@dashboard_login_required
+def api_list_users():
+    try:
+        limit = int(request.args.get("limit", 50))
+        offset = int(request.args.get("offset", 0))
+        search = request.args.get("search")
+        result = list_users(limit=limit, offset=offset, search=search)
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+    except ValueError:
+        return jsonify({"error": "Invalid limit or offset."}), 400
+
+    return jsonify(result)
+
+
+@app.get("/api/users/stats")
+@dashboard_login_required
+def api_user_stats():
+    try:
+        result = get_user_stats()
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    return jsonify(result)
+
+
+@app.get("/api/users/<int:user_id>")
+@dashboard_login_required
+def api_get_user(user_id: int):
+    try:
+        result = get_user(user_id)
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    return jsonify(result)
+
+
+@app.put("/api/users/<int:user_id>")
+@dashboard_login_required
+def api_update_user(user_id: int):
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON body required."}), 400
+
+    try:
+        result = update_user(user_id, payload)
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    return jsonify(result)
+
+
+@app.delete("/api/users/<int:user_id>")
+@dashboard_login_required
+def api_delete_user(user_id: int):
+    try:
+        delete_user(user_id)
+    except UserRegistrationError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    return jsonify({"deleted": True, "userId": user_id})
+
+
+def _dashboard_dir() -> Path:
+    return Path(__file__).with_name("static") / "dashboard"
+
+
+def _dashboard_built() -> bool:
+    return (_dashboard_dir() / "index.html").is_file()
+
+
+def _safe_dashboard_file(path: str) -> Path | None:
+    """Resolve a path under static/dashboard, rejecting traversal."""
+    if not path or path.startswith("/"):
+        return None
+    base = _dashboard_dir().resolve()
+    candidate = (base / path).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+@app.get("/dashboard")
+def dashboard_redirect():
+    return redirect("/dashboard/", code=302)
+
+
+@app.get("/dashboard/")
+@app.get("/dashboard/<path:path>")
+def dashboard_spa(path: str = ""):
+    """Serve the built React dashboard SPA from backend/static/dashboard/."""
+    if not _dashboard_built():
+        return (
+            jsonify(
+                {
+                    "error": "Dashboard not built.",
+                    "hint": "Run ./scripts/build-frontend.sh from the repo root.",
+                }
+            ),
+            503,
+        )
+
+    if path:
+        asset = _safe_dashboard_file(path)
+        if asset is not None:
+            return send_from_directory(asset.parent, asset.name)
+
+    return send_from_directory(_dashboard_dir(), "index.html")
+
+
 @app.get("/")
 def home():
     return render_template("chat.html")
@@ -207,8 +444,14 @@ def health_check():
             "foundryConfigured": foundry_service.is_configured(),
             "voiceConfigured": is_voice_configured(),
             "sqlConfigured": is_sql_configured(),
+            "dashboardBuilt": _dashboard_built(),
             "backendPublicUrl": backend_public_url() or None,
             "registrationOpenApi": "/openapi/register-user.json",
+            "routes": {
+                "chat": "/",
+                "dashboard": "/dashboard/",
+                "health": "/health",
+            },
         }
     )
 

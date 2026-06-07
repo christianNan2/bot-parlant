@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Iterator
@@ -13,25 +14,57 @@ import pyodbc
 from azure.identity import DefaultAzureCredential
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PLACEHOLDER_EMAIL_LOCALS = frozenset({"none", "null", "undefined", "n/a", "na", "unknown"})
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 SQL_AZURE_AD_SCOPE = "https://database.windows.net/.default"
 
 # Logical field → possible SQL column names (first match wins).
+# Current dbo.Users schema: id, firstName, lastName, email, birthDate,
+# phone, street, zip, city, country.
 _USERS_COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "first_name": ("FirstName", "firstName", "first_name"),
-    "last_name": ("LastName", "lastName", "last_name"),
-    "birth_date": ("BirthDate", "birthDate", "birth_date"),
-    "email": ("Email", "email"),
-    "phone_number": ("PhoneNumber", "phone", "phoneNumber", "phone_number"),
-    "street_address": ("StreetAddress", "street", "streetAddress", "street_address"),
-    "zip_code": ("ZipCode", "zip", "zipCode", "zip_code"),
-    "city": ("City", "city"),
-    "country": ("Country", "country"),
-    "created_at": ("CreatedAt", "createdAt", "created_at"),
+    "first_name": ("firstName", "FirstName", "first_name"),
+    "last_name": ("lastName", "LastName", "last_name"),
+    "birth_date": ("birthDate", "BirthDate", "birth_date"),
+    "email": ("email", "Email"),
+    "phone_number": ("phone", "PhoneNumber", "phoneNumber", "phone_number"),
+    "street_address": ("street", "StreetAddress", "streetAddress", "street_address"),
+    "zip_code": ("zip", "ZipCode", "zipCode", "zip_code"),
+    "city": ("city", "City"),
+    "country": ("country", "Country"),
+    "created_at": ("createdAt", "CreatedAt", "created_at"),
 }
-_USERS_ID_CANDIDATES = ("UserId", "id", "userId", "user_id")
+_USERS_ID_CANDIDATES = ("id", "UserId", "userId", "user_id")
 
 _users_columns_cache: set[str] | None = None
+
+
+@dataclass(frozen=True)
+class SqlCredentials:
+    username: str
+    password: str
+
+
+_sql_credentials_override: ContextVar[SqlCredentials | None] = ContextVar(
+    "sql_credentials_override",
+    default=None,
+)
+
+
+def set_sql_credentials_override(credentials: SqlCredentials | None) -> Token:
+    return _sql_credentials_override.set(credentials)
+
+
+def reset_sql_credentials_override(token: Token) -> None:
+    _sql_credentials_override.reset(token)
+
+
+def is_dashboard_sql_configured() -> bool:
+    """True when server/database are set; dashboard login supplies credentials."""
+    if (os.getenv("AZURE_SQL_CONNECTION_STRING") or "").strip():
+        return True
+    server = (os.getenv("AZURE_SQL_SERVER") or "").strip()
+    database = (os.getenv("AZURE_SQL_DATABASE") or "").strip()
+    return bool(server and database)
 
 
 class UserRegistrationError(Exception):
@@ -41,6 +74,17 @@ class UserRegistrationError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+def _database_error(exc: pyodbc.Error) -> UserRegistrationError:
+    message = str(exc).lower()
+    if "not allowed to access the server" in message or "40615" in message:
+        return UserRegistrationError(
+            "Database firewall blocked the server. In Azure Portal, open the SQL server "
+            "Networking page and allow Azure services, or add this App Service outbound IPs.",
+            status_code=503,
+        )
+    return UserRegistrationError(f"Database error: {exc}", status_code=500)
 
 
 @dataclass(frozen=True)
@@ -71,6 +115,8 @@ def is_sql_configured() -> bool:
 
 
 def _use_aad_auth() -> bool:
+    if _sql_credentials_override.get() is not None:
+        return False
     explicit = (os.getenv("AZURE_SQL_USE_AAD") or "").strip().lower()
     if explicit in ("1", "true", "yes"):
         return True
@@ -110,17 +156,45 @@ def _build_connection_string(*, include_sql_auth: bool) -> str:
     )
 
     if include_sql_auth:
-        user = (os.getenv("AZURE_SQL_USER") or "").strip()
-        password = os.getenv("AZURE_SQL_PASSWORD") or ""
-        if not user or not password:
-            raise UserRegistrationError(
-                "SQL password is missing. Set AZURE_SQL_PASSWORD, or set AZURE_SQL_USE_AAD=true "
-                "and sign in with Azure CLI (az login) / managed identity in Azure.",
-                status_code=503,
-            )
-        conn_str += f"Uid={user};Pwd={password};"
+        override = _sql_credentials_override.get()
+        if override is not None:
+            conn_str += f"Uid={override.username};Pwd={override.password};"
+        else:
+            user = (os.getenv("AZURE_SQL_USER") or "").strip()
+            password = os.getenv("AZURE_SQL_PASSWORD") or ""
+            if not user or not password:
+                raise UserRegistrationError(
+                    "SQL password is missing. Set AZURE_SQL_PASSWORD, or set AZURE_SQL_USE_AAD=true "
+                    "and sign in with Azure CLI (az login) / managed identity in Azure.",
+                    status_code=503,
+                )
+            conn_str += f"Uid={user};Pwd={password};"
 
     return conn_str
+
+
+def verify_sql_login(username: str, password: str) -> None:
+    """Validate SQL credentials by opening a connection."""
+    username = username.strip()
+    if not username or not password:
+        raise UserRegistrationError("Username and password are required.", status_code=400)
+    if not is_dashboard_sql_configured():
+        raise UserRegistrationError(
+            "Database server is not configured. Set AZURE_SQL_SERVER and AZURE_SQL_DATABASE.",
+            status_code=503,
+        )
+
+    token = set_sql_credentials_override(SqlCredentials(username=username, password=password))
+    try:
+        with _connection() as conn:
+            conn.cursor().execute("SELECT 1;")
+    except pyodbc.Error as exc:
+        message = str(exc).lower()
+        if "login failed" in message or "18456" in message:
+            raise UserRegistrationError("Invalid username or password.", status_code=401) from exc
+        raise UserRegistrationError(f"Database connection failed: {exc}", status_code=503) from exc
+    finally:
+        reset_sql_credentials_override(token)
 
 
 def _open_connection() -> pyodbc.Connection:
@@ -185,6 +259,9 @@ def user_from_payload(payload: dict[str, Any]) -> UserRecord:
         raise UserRegistrationError("firstName and lastName are required.")
     if not email or not EMAIL_RE.match(email):
         raise UserRegistrationError("A valid email is required.")
+    local_part = email.split("@", 1)[0]
+    if local_part in _PLACEHOLDER_EMAIL_LOCALS:
+        raise UserRegistrationError("A valid email is required (not a placeholder).")
 
     birth_raw = _pick(payload, "birthDate", "birth_date")
     return UserRecord(
@@ -192,9 +269,9 @@ def user_from_payload(payload: dict[str, Any]) -> UserRecord:
         last_name=last_name,
         email=email,
         birth_date=_parse_birth_date(birth_raw),
-        phone_number=_pick(payload, "phoneNumber", "phone_number"),
-        street_address=_pick(payload, "streetAddress", "street_address"),
-        zip_code=_pick(payload, "zipCode", "zip_code"),
+        phone_number=_pick(payload, "phone", "phoneNumber", "phone_number"),
+        street_address=_pick(payload, "street", "streetAddress", "street_address"),
+        zip_code=_pick(payload, "zip", "zipCode", "zip_code"),
         city=_pick(payload, "city"),
         country=_pick(payload, "country"),
     )
@@ -297,9 +374,9 @@ def register_user(user: UserRecord) -> dict[str, Any]:
                 f"A user with email {user.email} is already registered.",
                 status_code=409,
             ) from exc
-        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+        raise _database_error(exc) from exc
     except pyodbc.Error as exc:
-        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+        raise _database_error(exc) from exc
 
     user_id: int | None = None
     created_at: str | None = None
@@ -318,3 +395,229 @@ def register_user(user: UserRecord) -> dict[str, Any]:
     if user_id is not None:
         result["userId"] = user_id
     return result
+
+
+def _resolve_id_column(available: set[str]) -> str:
+    col = next((name for name in _USERS_ID_CANDIDATES if name in available), None)
+    if not col:
+        raise UserRegistrationError("dbo.Users has no id column.", status_code=503)
+    return col
+
+
+def _row_to_user(row: pyodbc.Row, columns: list[str], available: set[str]) -> dict[str, Any]:
+    """Map a SQL row to a camelCase API dict."""
+    data = {columns[i]: row[i] for i in range(len(columns))}
+    id_col = _resolve_id_column(available)
+
+    def get_logical(logical: str) -> Any:
+        col = _resolve_column(available, logical)
+        if not col:
+            return None
+        value = data.get(col)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        return value
+
+    user: dict[str, Any] = {
+        "userId": data.get(id_col),
+        "firstName": get_logical("first_name"),
+        "lastName": get_logical("last_name"),
+        "email": get_logical("email"),
+        "birthDate": get_logical("birth_date"),
+        "phoneNumber": get_logical("phone_number"),
+        "streetAddress": get_logical("street_address"),
+        "zipCode": get_logical("zip_code"),
+        "city": get_logical("city"),
+        "country": get_logical("country"),
+        "createdAt": get_logical("created_at"),
+    }
+    return {k: v for k, v in user.items() if v is not None or k == "userId"}
+
+
+def _select_columns(available: set[str]) -> list[str]:
+    id_col = _resolve_id_column(available)
+    cols = [id_col]
+    for logical in _USERS_COLUMN_CANDIDATES:
+        col = _resolve_column(available, logical)
+        if col and col not in cols:
+            cols.append(col)
+    return cols
+
+
+def list_users(*, limit: int = 50, offset: int = 0, search: str | None = None) -> dict[str, Any]:
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    search = (search or "").strip()
+
+    try:
+        with _connection() as conn:
+            available = _load_users_columns(conn)
+            cols = _select_columns(available)
+            id_col = _resolve_id_column(available)
+            email_col = _resolve_column(available, "email")
+            first_col = _resolve_column(available, "first_name")
+            last_col = _resolve_column(available, "last_name")
+            created_col = _resolve_column(available, "created_at")
+
+            where = ""
+            params: list[Any] = []
+            if search and email_col:
+                clauses = [f"[{email_col}] LIKE ?"]
+                params.append(f"%{search}%")
+                if first_col:
+                    clauses.append(f"[{first_col}] LIKE ?")
+                    params.append(f"%{search}%")
+                if last_col:
+                    clauses.append(f"[{last_col}] LIKE ?")
+                    params.append(f"%{search}%")
+                where = "WHERE " + " OR ".join(clauses)
+
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM dbo.Users {where};", params)
+            total = int(cursor.fetchone()[0])
+
+            order = f"ORDER BY [{created_col or id_col}] DESC" if (created_col or id_col) else ""
+            select_list = ", ".join(f"[{c}]" for c in cols)
+            cursor.execute(
+                f"SELECT {select_list} FROM dbo.Users {where} {order} "
+                f"OFFSET ? ROWS FETCH NEXT ? ROWS ONLY;",
+                [*params, offset, limit],
+            )
+            rows = cursor.fetchall()
+            users = [_row_to_user(row, cols, available) for row in rows]
+    except pyodbc.Error as exc:
+        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+
+    return {"users": users, "total": total, "limit": limit, "offset": offset}
+
+
+def get_user(user_id: int) -> dict[str, Any]:
+    try:
+        with _connection() as conn:
+            available = _load_users_columns(conn)
+            cols = _select_columns(available)
+            id_col = _resolve_id_column(available)
+            select_list = ", ".join(f"[{c}]" for c in cols)
+            row = conn.cursor().execute(
+                f"SELECT {select_list} FROM dbo.Users WHERE [{id_col}] = ?;",
+                (user_id,),
+            ).fetchone()
+    except pyodbc.Error as exc:
+        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+
+    if not row:
+        raise UserRegistrationError(f"User {user_id} not found.", status_code=404)
+    return _row_to_user(row, cols, available)
+
+
+def update_user(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    user = user_from_payload({**payload, "userId": user_id})
+    try:
+        with _connection() as conn:
+            available = _load_users_columns(conn)
+            id_col = _resolve_id_column(available)
+            existing = conn.cursor().execute(
+                f"SELECT 1 FROM dbo.Users WHERE [{id_col}] = ?;",
+                (user_id,),
+            ).fetchone()
+            if not existing:
+                raise UserRegistrationError(f"User {user_id} not found.", status_code=404)
+
+            value_map: dict[str, Any] = {
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "birth_date": user.birth_date,
+                "email": user.email,
+                "phone_number": user.phone_number,
+                "street_address": user.street_address,
+                "zip_code": user.zip_code,
+                "city": user.city,
+                "country": user.country,
+            }
+
+            set_parts: list[str] = []
+            params: list[Any] = []
+            for logical, value in value_map.items():
+                col = _resolve_column(available, logical)
+                if not col:
+                    continue
+                set_parts.append(f"[{col}] = ?")
+                params.append(value)
+
+            if not set_parts:
+                raise UserRegistrationError("No updatable columns resolved.", status_code=503)
+
+            params.append(user_id)
+            conn.cursor().execute(
+                f"UPDATE dbo.Users SET {', '.join(set_parts)} WHERE [{id_col}] = ?;",
+                params,
+            )
+    except pyodbc.IntegrityError as exc:
+        if "UNIQUE" in str(exc).upper() or "2627" in str(exc):
+            raise UserRegistrationError(
+                f"A user with email {user.email} is already registered.",
+                status_code=409,
+            ) from exc
+        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+    except pyodbc.Error as exc:
+        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+
+    return get_user(user_id)
+
+
+def delete_user(user_id: int) -> None:
+    try:
+        with _connection() as conn:
+            available = _load_users_columns(conn)
+            id_col = _resolve_id_column(available)
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM dbo.Users WHERE [{id_col}] = ?;", (user_id,))
+            if cursor.rowcount == 0:
+                raise UserRegistrationError(f"User {user_id} not found.", status_code=404)
+    except pyodbc.Error as exc:
+        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+
+
+def get_user_stats() -> dict[str, Any]:
+    try:
+        with _connection() as conn:
+            available = _load_users_columns(conn)
+            created_col = _resolve_column(available, "created_at")
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM dbo.Users;")
+            total = int(cursor.fetchone()[0])
+
+            today = 0
+            week = 0
+            if created_col:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        SUM(CASE WHEN CAST([{created_col}] AS date) = CAST(SYSUTCDATETIME() AS date) THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN [{created_col}] >= DATEADD(day, -7, SYSUTCDATETIME()) THEN 1 ELSE 0 END)
+                    FROM dbo.Users;
+                    """
+                )
+                row = cursor.fetchone()
+                today = int(row[0] or 0)
+                week = int(row[1] or 0)
+
+            by_country: list[dict[str, Any]] = []
+            country_col = _resolve_column(available, "country")
+            if country_col:
+                cursor.execute(
+                    f"""
+                    SELECT [{country_col}], COUNT(*)
+                    FROM dbo.Users
+                    WHERE [{country_col}] IS NOT NULL AND LTRIM(RTRIM([{country_col}])) <> ''
+                    GROUP BY [{country_col}]
+                    ORDER BY COUNT(*) DESC;
+                    """
+                )
+                by_country = [{"country": str(r[0]), "count": int(r[1])} for r in cursor.fetchall()]
+    except pyodbc.Error as exc:
+        raise UserRegistrationError(f"Database error: {exc}", status_code=500) from exc
+
+    return {"total": total, "registeredToday": today, "registeredThisWeek": week, "byCountry": by_country}

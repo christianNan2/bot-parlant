@@ -60,8 +60,27 @@ body {
   margin-bottom: 1.25rem;
 }
 
+.chat-head-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.35rem;
+}
+
+.dashboard-link {
+  font-size: 0.9rem;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.dashboard-link:hover {
+  text-decoration: underline;
+}
+
 .chat-head h1 {
-  margin: 0 0 0.35rem;
+  margin: 0;
   font-family: var(--font-display);
   font-size: clamp(1.6rem, 3vw, 2rem);
 }

@@ -1,5 +1,28 @@
 # Deploy to Azure App Service
 
+## Single app, two paths
+
+Everything runs on **one Flask instance** (local or Azure App Service):
+
+| Path | App |
+|------|-----|
+| `/` | Registration chat agent (voice + text) |
+| `/dashboard/` | Users dashboard (React, built into `backend/static/dashboard/`) |
+| `/api/*` | Shared JSON API (chat, registration, dashboard) |
+| `/health` | Health check |
+
+Build the dashboard before deploy (included in the scripts below):
+
+```bash
+./scripts/build-frontend.sh   # npm build → backend/static/dashboard/
+cd backend && python app.py   # one server on PORT (default 5444)
+```
+
+- Chat: http://localhost:5444/
+- Dashboard: http://localhost:5444/dashboard/
+
+The frontend is **not** a separate host in production — `frontend/` is only the source; output is static files served by Flask.
+
 ## What went wrong
 
 Zip deploy with `SCM_DO_BUILD_DURING_DEPLOYMENT=true` runs **Oryx** on the server: it `pip install`s everything in `requirements.txt`, including heavy packages (`azure-ai-voicelive`, `azure-ai-projects`, `gevent`, `pyodbc`). That step often takes **20–35 minutes** on a small plan. Stopping the CLI with Ctrl+C leaves the site in a bad state (503) until a full deploy finishes.
