@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Registration Bot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Space+Grotesk:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="chat">
+        <div class="chat-head">
+          <h1>Registration</h1>
+          <p>Answer the prompts. Type "reset" to restart.</p>
+        </div>
+        <div id="voice-bar" class="voice-bar" hidden>
+          <button
+            type="button"
+            id="voice-toggle"
+            class="voice-toggle"
+            aria-pressed="false"
+          >
+            Start voice
+          </button>
+          <span id="voice-status" class="voice-status" aria-live="polite"></span>
+        </div>
+        <div id="chat-log" class="chat-log" aria-live="polite"></div>
+        <form id="chat-form" class="chat-form">
+          <input
+            id="chat-input"
+            name="chatInput"
+            type="text"
+            placeholder="Type your answer..."
+            autocomplete="off"
+            required
+          />
+          <button type="submit" id="chat-send">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+Flask
+gunicorn
+gevent
+flask-sock
+azure-ai-projects
+azure-ai-voicelive[aiohttp]
+aiohttp
+azure-identity
+python-dotenv
+pyodbc
+PyYAML

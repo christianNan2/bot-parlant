@@ -1,0 +1,9 @@
+backend/.venv/
+backend/.env
+__pycache__/
+*.pyc
+.DS_Store
+deploy/*.zip
+backend/deploy.zip
+backend/*.zip
+backend/antenv/
