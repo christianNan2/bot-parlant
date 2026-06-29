@@ -46,6 +46,10 @@ az webapp config appsettings set -g rg-voicebot-sose26 -n UserRegistrationBot \
 ./scripts/deploy-to-azure.sh UserRegistrationBot rg-voicebot-sose26 --prebuilt
 ```
 
+## Auto deploy (GitHub Actions)
+
+For CI/CD on every push to `main`, see [CI-CD-SETUP.md](./CI-CD-SETUP.md).
+
 ## Verify
 
 ```bash

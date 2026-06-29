@@ -1,0 +1,140 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
+  ORYX_BUILD_IMAGE: mcr.microsoft.com/azure-app-service/python:3.12
+
+jobs:
+  build:
+    name: Build & verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Validate backend imports
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m compileall -q .
+
+      - name: Build Linux deployment zip
+        run: ./scripts/build-deploy-zip-linux.sh
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-zip
+          path: deploy/app.zip
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Azure
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-zip
+          path: deploy
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Use pre-built venv (skip Oryx pip install)
+        run: |
+          az webapp config appsettings set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+            --output none
+
+      - name: Deploy zip to App Service
+        run: |
+          HOST="$(az webapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --query defaultHostName -o tsv)"
+
+          echo "Deploying to https://${HOST}"
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --src-path deploy/app.zip \
+            --type zip \
+            --clean true \
+            --restart true \
+            --track-status true \
+            --timeout 3600000
+
+      - name: Health check
+        run: |
+          HOST="$(az webapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --query defaultHostName -o tsv)"
+
+          for attempt in 1 2 3 4 5 6; do
+            CODE="$(curl -sS -m 20 -o /tmp/health.json -w "%{http_code}" "https://${HOST}/health" || true)"
+            if [[ "$CODE" == "200" ]]; then
+              cat /tmp/health.json
+              echo ""
+              echo "OK — https://${HOST}"
+              exit 0
+            fi
+            echo "Attempt ${attempt}: /health returned HTTP ${CODE:-unknown}, retrying..."
+            sleep 10
+          done
+
+          echo "Deploy finished but /health did not return 200."
+          az webapp log tail \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" &
+          sleep 30
+          exit 1
